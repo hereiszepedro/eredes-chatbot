@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-REDES — Assistente Tempestade Kristin</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="chat-container">
+        <header class="chat-header">
+            <div class="header-content">
+                <div class="logo-area">
+                    <div class="logo-icon">E</div>
+                    <div>
+                        <h1>E-REDES</h1>
+                        <p class="subtitle">Assistente — Tempestade Kristin</p>
+                    </div>
+                </div>
+                <div class="emergency-badge">
+                    Avarias: <strong>800 506 506</strong>
+                </div>
+            </div>
+        </header>
+
+        <div class="chat-messages" id="chat-messages">
+            <div class="message bot-message">
+                <div class="message-content">
+                    Olá! Sou a assistente virtual da E-REDES. Estou aqui para ajudar com informações sobre a <strong>Tempestade Kristin</strong> e o estado da rede elétrica na sua zona.<br><br>
+                    Pode perguntar-me sobre:
+                    <ul>
+                        <li>Estado das avarias na sua zona (indique código postal ou concelho)</li>
+                        <li>Previsão de reposição de energia</li>
+                        <li>Conselhos de segurança</li>
+                        <li>Direitos de compensação</li>
+                    </ul>
+                    Como posso ajudar?
+                </div>
+            </div>
+        </div>
+
+        <div class="chat-input-area">
+            <form id="chat-form">
+                <input
+                    type="text"
+                    id="chat-input"
+                    placeholder="Escreva a sua mensagem..."
+                    autocomplete="off"
+                    autofocus
+                >
+                <button type="submit" id="send-btn">Enviar</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
