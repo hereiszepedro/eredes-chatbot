@@ -1,8 +1,8 @@
-openai
-fastapi
-uvicorn[standard]
-httpx
-pydantic
-slowapi
-pydantic-settings
-python-json-logger
+openai==2.16.0
+fastapi==0.128.0
+uvicorn[standard]==0.40.0
+httpx==0.28.1
+pydantic==2.12.5
+slowapi==0.1.9
+pydantic-settings==2.12.0
+python-json-logger==4.0.0
