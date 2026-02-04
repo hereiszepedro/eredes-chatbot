@@ -1,8 +1,17 @@
 """Real E-REDES Open Data API client for scheduled interruptions."""
 
+import re
+
 import httpx
 
 from config import EREDES_API_BASE, EREDES_DATASET
+
+
+def _sanitize_search_term(term: str) -> str:
+    """Strip non-alphanumeric/accent characters and truncate to 100 chars."""
+    # Allow letters (including accented), digits, spaces, and hyphens
+    cleaned = re.sub(r"[^\w\s\-]", "", term, flags=re.UNICODE)
+    return cleaned.strip()[:100]
 
 
 async def query_scheduled_interruptions(
@@ -24,10 +33,12 @@ async def query_scheduled_interruptions(
 
     where_clauses = []
     if municipality:
-        where_clauses.append(f'search(municipality, "{municipality}")')
+        safe_municipality = _sanitize_search_term(municipality)
+        where_clauses.append(f'search(municipality, "{safe_municipality}")')
     if postal_code:
         clean = postal_code.strip().replace("-", "")
-        where_clauses.append(f'search(zipcode, "{clean}")')
+        safe_postal = _sanitize_search_term(clean)
+        where_clauses.append(f'search(zipcode, "{safe_postal}")')
 
     params = {
         "limit": limit,

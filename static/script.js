@@ -3,8 +3,13 @@ const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 
-const sessionId =
-  "session-" + Math.random().toString(36).substring(2, 10);
+const sessionId = crypto.randomUUID();
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
 
 chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -58,7 +63,7 @@ function appendMessage(text, sender) {
   contentDiv.className = "message-content";
 
   if (sender === "bot") {
-    contentDiv.innerHTML = formatMarkdown(text);
+    contentDiv.innerHTML = formatMarkdown(escapeHtml(text));
   } else {
     contentDiv.textContent = text;
   }

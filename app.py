@@ -1,5 +1,6 @@
 """FastAPI backend for the E-REDES Storm Kristin chatbot."""
 
+import asyncio
 import json
 import logging
 import os
@@ -7,10 +8,11 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI, BadRequestError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,17 @@ from config import GROQ_BASE_URL, GROQ_MODEL
 from openai_tools import TOOLS, handle_tool_call
 from system_prompt import SYSTEM_PROMPT
 
+CHAT_TIMEOUT_SECONDS = 60
+
 app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin")
+
+# ── CORS middleware ────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # ── Groq client (OpenAI-compatible) ─────────────────────────────────────────
 client: AsyncOpenAI | None = None
@@ -31,7 +43,6 @@ async def startup():
     if api_key:
         client = AsyncOpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
     else:
-        import logging
         logging.warning(
             "GROQ_API_KEY not set. Chat will not work until "
             "the key is provided via environment variable."
@@ -60,8 +71,8 @@ def trim_session(messages: list[dict]) -> list[dict]:
 
 # ── Request / Response models ───────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    session_id: str
-    message: str
+    session_id: str = Field(..., pattern=r"^[a-zA-Z0-9_-]{1,100}$")
+    message: str = Field(..., max_length=2000)
 
 
 class ChatResponse(BaseModel):
@@ -73,87 +84,29 @@ class ChatResponse(BaseModel):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     if not req.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
 
     if client is None:
         raise HTTPException(
             status_code=503,
-            detail="GROQ_API_KEY não configurada. O servidor precisa da variável de ambiente GROQ_API_KEY.",
+            detail="Serviço temporariamente indisponível. Por favor, tente mais tarde.",
         )
 
     session_id = req.session_id or str(uuid.uuid4())
     messages = get_session(session_id)
     messages.append({"role": "user", "content": req.message})
 
-    # Tool-call loop: keep going until the model returns text
-    max_iterations = 10
-    reply = ""
     try:
-        for _ in range(max_iterations):
-            try:
-                response = await client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=messages,
-                    tools=TOOLS,
-                )
-            except BadRequestError as e:
-                if "tool_use_failed" in str(e):
-                    # Model generated a malformed tool call — retry without tools
-                    logger.warning("Tool call failed, retrying without tools: %s", e)
-                    response = await client.chat.completions.create(
-                        model=GROQ_MODEL,
-                        messages=messages,
-                    )
-                else:
-                    raise
-
-            choice = response.choices[0]
-
-            if choice.finish_reason == "tool_calls" or choice.message.tool_calls:
-                # Append the assistant message with tool calls
-                # Only include fields Groq supports (exclude 'annotations' etc.)
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": choice.message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in choice.message.tool_calls
-                    ],
-                }
-                messages.append(assistant_msg)
-
-                # Execute each tool call
-                for tool_call in choice.message.tool_calls:
-                    fn_name = tool_call.function.name
-                    fn_args = json.loads(tool_call.function.arguments)
-                    result = await handle_tool_call(fn_name, fn_args)
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result,
-                        }
-                    )
-            else:
-                # Final text response
-                reply = choice.message.content or ""
-                messages.append({"role": "assistant", "content": reply})
-                break
-        else:
-            reply = (
-                "Peço desculpa, não consegui processar o seu pedido. "
-                "Por favor, tente novamente ou contacte a Linha de Avarias: "
-                "800 506 506."
-            )
-            messages.append({"role": "assistant", "content": reply})
+        reply = await asyncio.wait_for(
+            _process_chat(messages),
+            timeout=CHAT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        messages.pop()
+        raise HTTPException(
+            status_code=504,
+            detail="O pedido demorou demasiado tempo. Por favor, tente novamente.",
+        )
     except Exception as e:
         # Remove the user message since the call failed
         messages.pop()
@@ -161,14 +114,87 @@ async def chat(req: ChatRequest):
         if "rate_limit" in err_str.lower() or "429" in err_str:
             raise HTTPException(
                 status_code=429,
-                detail="Limite de utilização da API atingido. Por favor, tente novamente dentro de alguns segundos.",
+                detail="Limite de utilização atingido. Por favor, tente novamente dentro de alguns segundos.",
             )
-        raise HTTPException(status_code=502, detail=f"Erro na API: {e}")
+        logger.error("Chat processing error: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail="Erro interno do serviço. Por favor, tente novamente.",
+        )
 
     # Trim session to avoid unbounded growth
     sessions[session_id] = trim_session(messages)
 
     return ChatResponse(reply=reply, session_id=session_id)
+
+
+async def _process_chat(messages: list[dict]) -> str:
+    """Run the tool-call loop and return the final reply text."""
+    max_iterations = 10
+    reply = ""
+
+    for _ in range(max_iterations):
+        try:
+            response = await client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                tools=TOOLS,
+            )
+        except BadRequestError as e:
+            if "tool_use_failed" in str(e):
+                logger.warning("Tool call failed, retrying without tools: %s", e)
+                response = await client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                )
+            else:
+                raise
+
+        choice = response.choices[0]
+
+        if choice.finish_reason == "tool_calls" or choice.message.tool_calls:
+            assistant_msg = {
+                "role": "assistant",
+                "content": choice.message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in choice.message.tool_calls
+                ],
+            }
+            messages.append(assistant_msg)
+
+            for tool_call in choice.message.tool_calls:
+                fn_name = tool_call.function.name
+                fn_args = json.loads(tool_call.function.arguments)
+                result = await handle_tool_call(fn_name, fn_args)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    }
+                )
+        else:
+            reply = choice.message.content or ""
+            messages.append({"role": "assistant", "content": reply})
+            break
+    else:
+        reply = (
+            "Peço desculpa, não consegui processar o seu pedido. "
+            "Por favor, tente novamente ou contacte a Linha de Avarias: "
+            "800 506 506."
+        )
+        messages.append({"role": "assistant", "content": reply})
+
+    return reply
 
 
 # ── Serve static frontend ───────────────────────────────────────────────────
