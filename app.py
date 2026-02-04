@@ -15,16 +15,39 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-
-logger = logging.getLogger(__name__)
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
+from logging_config import generate_request_id, setup_logging
 from openai_tools import TOOLS, handle_tool_call
 from system_prompt import SYSTEM_PROMPT
+
+setup_logging(settings.log_level)
+logger = logging.getLogger(__name__)
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin")
 app.state.limiter = limiter
+
+
+# ── Request ID middleware ──────────────────────────────────────────────────
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = generate_request_id()
+        logger.info(
+            "request_started",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+            },
+        )
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -57,7 +80,7 @@ async def startup():
             api_key=settings.groq_api_key, base_url=settings.groq_base_url
         )
     else:
-        logging.warning(
+        logger.warning(
             "GROQ_API_KEY not set. Chat will not work until "
             "the key is provided via environment variable."
         )
@@ -93,6 +116,16 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+# ── Health check ───────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "groq_configured": client is not None,
+        "active_sessions": len(sessions),
+    }
+
+
 # ── Chat endpoint ───────────────────────────────────────────────────────────
 @app.post("/api/chat", response_model=ChatResponse)
 @limiter.limit(settings.rate_limit)
@@ -110,6 +143,11 @@ async def chat(request: Request, req: ChatRequest):
     messages = get_session(session_id)
     messages.append({"role": "user", "content": req.message})
 
+    logger.info(
+        "chat_request",
+        extra={"session_id": session_id, "message_length": len(req.message)},
+    )
+
     try:
         reply = await asyncio.wait_for(
             _process_chat(messages),
@@ -117,12 +155,12 @@ async def chat(request: Request, req: ChatRequest):
         )
     except asyncio.TimeoutError:
         messages.pop()
+        logger.warning("chat_timeout", extra={"session_id": session_id})
         raise HTTPException(
             status_code=504,
             detail="O pedido demorou demasiado tempo. Por favor, tente novamente.",
         )
     except Exception as e:
-        # Remove the user message since the call failed
         messages.pop()
         err_str = str(e)
         if "rate_limit" in err_str.lower() or "429" in err_str:
@@ -130,11 +168,16 @@ async def chat(request: Request, req: ChatRequest):
                 status_code=429,
                 detail="Limite de utilização atingido. Por favor, tente novamente dentro de alguns segundos.",
             )
-        logger.error("Chat processing error: %s", e)
+        logger.error("chat_error", extra={"session_id": session_id, "error": str(e)})
         raise HTTPException(
             status_code=502,
             detail="Erro interno do serviço. Por favor, tente novamente.",
         )
+
+    logger.info(
+        "chat_response",
+        extra={"session_id": session_id, "reply_length": len(reply)},
+    )
 
     # Trim session to avoid unbounded growth
     sessions[session_id] = trim_session(messages)

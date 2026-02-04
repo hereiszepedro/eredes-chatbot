@@ -5,3 +5,4 @@ httpx
 pydantic
 slowapi
 pydantic-settings
+python-json-logger
