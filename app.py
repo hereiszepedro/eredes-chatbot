@@ -1,6 +1,7 @@
 """FastAPI backend for the E-REDES Storm Kristin chatbot."""
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -8,8 +9,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from config import GROQ_BASE_URL, GROQ_MODEL
 from openai_tools import TOOLS, handle_tool_call
@@ -87,11 +90,22 @@ async def chat(req: ChatRequest):
     reply = ""
     try:
         for _ in range(max_iterations):
-            response = await client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                tools=TOOLS,
-            )
+            try:
+                response = await client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    tools=TOOLS,
+                )
+            except BadRequestError as e:
+                if "tool_use_failed" in str(e):
+                    # Model generated a malformed tool call — retry without tools
+                    logger.warning("Tool call failed, retrying without tools: %s", e)
+                    response = await client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=messages,
+                    )
+                else:
+                    raise
 
             choice = response.choices[0]
 
