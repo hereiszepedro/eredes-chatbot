@@ -3,7 +3,7 @@
 import logging
 import uuid
 
-from pythonjsonlogger import jsonlogger
+from pythonjsonlogger.json import JsonFormatter
 
 
 def generate_request_id() -> str:
@@ -12,7 +12,7 @@ def generate_request_id() -> str:
 
 def setup_logging(level: str = "INFO") -> None:
     handler = logging.StreamHandler()
-    formatter = jsonlogger.JsonFormatter(
+    formatter = JsonFormatter(
         fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
         rename_fields={"asctime": "timestamp", "levelname": "level"},
     )
