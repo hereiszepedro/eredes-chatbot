@@ -4,3 +4,4 @@ uvicorn[standard]
 httpx
 pydantic
 slowapi
+pydantic-settings

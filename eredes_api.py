@@ -4,7 +4,7 @@ import re
 
 import httpx
 
-from config import EREDES_API_BASE, EREDES_DATASET
+from config import settings
 
 
 def _sanitize_search_term(term: str) -> str:
@@ -29,7 +29,7 @@ async def query_scheduled_interruptions(
     Returns:
         dict with results or error information.
     """
-    url = f"{EREDES_API_BASE}/{EREDES_DATASET}/records"
+    url = f"{settings.eredes_api_base}/{settings.eredes_dataset}/records"
 
     where_clauses = []
     if municipality:

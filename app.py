@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import os
 import uuid
 from pathlib import Path
 
@@ -19,11 +18,9 @@ from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
 
-from config import GROQ_BASE_URL, GROQ_MODEL
+from config import settings
 from openai_tools import TOOLS, handle_tool_call
 from system_prompt import SYSTEM_PROMPT
-
-CHAT_TIMEOUT_SECONDS = 60
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin")
@@ -43,7 +40,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # ── CORS middleware ────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins.split(","),
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -55,9 +52,10 @@ client: AsyncOpenAI | None = None
 @app.on_event("startup")
 async def startup():
     global client
-    api_key = os.environ.get("GROQ_API_KEY")
-    if api_key:
-        client = AsyncOpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+    if settings.groq_api_key:
+        client = AsyncOpenAI(
+            api_key=settings.groq_api_key, base_url=settings.groq_base_url
+        )
     else:
         logging.warning(
             "GROQ_API_KEY not set. Chat will not work until "
@@ -67,7 +65,6 @@ async def startup():
 
 # ── In-memory session store ─────────────────────────────────────────────────
 sessions: dict[str, list[dict]] = {}
-MAX_MESSAGES = 50
 
 
 def get_session(session_id: str) -> list[dict]:
@@ -80,9 +77,9 @@ def get_session(session_id: str) -> list[dict]:
 
 def trim_session(messages: list[dict]) -> list[dict]:
     """Keep system prompt + last MAX_MESSAGES messages."""
-    if len(messages) <= MAX_MESSAGES + 1:
+    if len(messages) <= settings.max_messages + 1:
         return messages
-    return [messages[0]] + messages[-(MAX_MESSAGES):]
+    return [messages[0]] + messages[-(settings.max_messages):]
 
 
 # ── Request / Response models ───────────────────────────────────────────────
@@ -98,7 +95,7 @@ class ChatResponse(BaseModel):
 
 # ── Chat endpoint ───────────────────────────────────────────────────────────
 @app.post("/api/chat", response_model=ChatResponse)
-@limiter.limit("10/minute")
+@limiter.limit(settings.rate_limit)
 async def chat(request: Request, req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
@@ -116,7 +113,7 @@ async def chat(request: Request, req: ChatRequest):
     try:
         reply = await asyncio.wait_for(
             _process_chat(messages),
-            timeout=CHAT_TIMEOUT_SECONDS,
+            timeout=settings.chat_timeout_seconds,
         )
     except asyncio.TimeoutError:
         messages.pop()
@@ -153,7 +150,7 @@ async def _process_chat(messages: list[dict]) -> str:
     for _ in range(max_iterations):
         try:
             response = await client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=settings.groq_model,
                 messages=messages,
                 tools=TOOLS,
             )
@@ -161,7 +158,7 @@ async def _process_chat(messages: list[dict]) -> str:
             if "tool_use_failed" in str(e):
                 logger.warning("Tool call failed, retrying without tools: %s", e)
                 response = await client.chat.completions.create(
-                    model=GROQ_MODEL,
+                    model=settings.groq_model,
                     messages=messages,
                 )
             else:
