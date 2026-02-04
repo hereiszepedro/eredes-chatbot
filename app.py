@@ -7,12 +7,15 @@ import os
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,20 @@ from system_prompt import SYSTEM_PROMPT
 
 CHAT_TIMEOUT_SECONDS = 60
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin")
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": "Limite de pedidos atingido. Por favor, aguarde um momento antes de tentar novamente."
+        },
+    )
+
 
 # ── CORS middleware ────────────────────────────────────────────────────────
 app.add_middleware(
@@ -82,7 +98,8 @@ class ChatResponse(BaseModel):
 
 # ── Chat endpoint ───────────────────────────────────────────────────────────
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+@limiter.limit("10/minute")
+async def chat(request: Request, req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
 
