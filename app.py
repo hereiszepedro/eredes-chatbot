@@ -3,14 +3,17 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from openai import AsyncOpenAI, BadRequestError
+from openai import APIConnectionError, AsyncOpenAI, BadRequestError, InternalServerError
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -25,8 +28,73 @@ from system_prompt import SYSTEM_PROMPT
 setup_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
+
+# ── Session dataclass ──────────────────────────────────────────────────────
+@dataclass
+class Session:
+    messages: list[dict] = field(default_factory=list)
+    last_accessed: float = field(default_factory=time.time)
+
+
+# ── In-memory session store ─────────────────────────────────────────────────
+sessions: dict[str, Session] = {}
+
+SESSION_MAX_AGE_SECONDS = 2 * 60 * 60  # 2 hours
+SESSION_MAX_COUNT = 1000
+SESSION_CLEANUP_INTERVAL = 5 * 60  # 5 minutes
+
+# ── Groq client (OpenAI-compatible) ─────────────────────────────────────────
+client: AsyncOpenAI | None = None
+
+
+async def _session_cleanup_loop():
+    """Background task that evicts stale sessions every 5 minutes."""
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+        now = time.time()
+        expired = [
+            sid
+            for sid, s in sessions.items()
+            if now - s.last_accessed > SESSION_MAX_AGE_SECONDS
+        ]
+        for sid in expired:
+            del sessions[sid]
+        if expired:
+            logger.info("sessions_cleaned", extra={"evicted": len(expired)})
+
+        # Cap total sessions
+        if len(sessions) > SESSION_MAX_COUNT:
+            by_age = sorted(sessions, key=lambda s: sessions[s].last_accessed)
+            to_remove = by_age[: len(sessions) - SESSION_MAX_COUNT]
+            for sid in to_remove:
+                del sessions[sid]
+            logger.info("sessions_capped", extra={"evicted": len(to_remove)})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client
+    if settings.groq_api_key:
+        client = AsyncOpenAI(
+            api_key=settings.groq_api_key, base_url=settings.groq_base_url
+        )
+    else:
+        logger.warning(
+            "GROQ_API_KEY not set. Chat will not work until "
+            "the key is provided via environment variable."
+        )
+
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin")
+app = FastAPI(title="E-REDES Chatbot — Tempestade Kristin", lifespan=lifespan)
 app.state.limiter = limiter
 
 
@@ -68,34 +136,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Groq client (OpenAI-compatible) ─────────────────────────────────────────
-client: AsyncOpenAI | None = None
-
-
-@app.on_event("startup")
-async def startup():
-    global client
-    if settings.groq_api_key:
-        client = AsyncOpenAI(
-            api_key=settings.groq_api_key, base_url=settings.groq_base_url
-        )
-    else:
-        logger.warning(
-            "GROQ_API_KEY not set. Chat will not work until "
-            "the key is provided via environment variable."
-        )
-
-
-# ── In-memory session store ─────────────────────────────────────────────────
-sessions: dict[str, list[dict]] = {}
-
 
 def get_session(session_id: str) -> list[dict]:
     if session_id not in sessions:
-        sessions[session_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-    return sessions[session_id]
+        sessions[session_id] = Session(
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}]
+        )
+    session = sessions[session_id]
+    session.last_accessed = time.time()
+    return session.messages
 
 
 def trim_session(messages: list[dict]) -> list[dict]:
@@ -180,9 +229,33 @@ async def chat(request: Request, req: ChatRequest):
     )
 
     # Trim session to avoid unbounded growth
-    sessions[session_id] = trim_session(messages)
+    sessions[session_id].messages = trim_session(messages)
 
     return ChatResponse(reply=reply, session_id=session_id)
+
+
+async def _call_groq_with_retry(messages: list[dict], use_tools: bool = True):
+    """Call Groq API with retry on 5xx / connection errors (max 2 retries)."""
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            kwargs = {
+                "model": settings.groq_model,
+                "messages": messages,
+            }
+            if use_tools:
+                kwargs["tools"] = TOOLS
+            return await client.chat.completions.create(**kwargs)
+        except (InternalServerError, APIConnectionError) as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning(
+                    "groq_retry",
+                    extra={"attempt": attempt + 1, "wait": wait, "error": str(e)},
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 async def _process_chat(messages: list[dict]) -> str:
@@ -192,18 +265,11 @@ async def _process_chat(messages: list[dict]) -> str:
 
     for _ in range(max_iterations):
         try:
-            response = await client.chat.completions.create(
-                model=settings.groq_model,
-                messages=messages,
-                tools=TOOLS,
-            )
+            response = await _call_groq_with_retry(messages)
         except BadRequestError as e:
             if "tool_use_failed" in str(e):
                 logger.warning("Tool call failed, retrying without tools: %s", e)
-                response = await client.chat.completions.create(
-                    model=settings.groq_model,
-                    messages=messages,
-                )
+                response = await _call_groq_with_retry(messages, use_tools=False)
             else:
                 raise
 
